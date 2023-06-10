@@ -65,13 +65,14 @@ Spectrum AOIntegrator::Li(const RayDifferential &r, const Scene &scene,
     SurfaceInteraction isect;
  retry:
     if (scene.Intersect(ray, &isect)) {
+        #ifndef PBRT_8_CLASSES_BENCHMARK
         isect.ComputeScatteringFunctions(ray, arena, true);
         if (!isect.bsdf) {
             VLOG(2) << "Skipping intersection due to null bsdf";
             ray = isect.SpawnRay(ray.d);
             goto retry;
         }
-
+        #endif
         // Compute coordinate frame based on true geometry, not shading
         // geometry.
         Normal3f n = Faceforward(isect.n, -ray.d);
