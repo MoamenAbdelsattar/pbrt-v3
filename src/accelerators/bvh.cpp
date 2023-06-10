@@ -39,6 +39,7 @@
 #include "parallel.h"
 #include <algorithm>
 
+
 namespace pbrt {
 
 STAT_MEMORY_COUNTER("Memory/BVH tree", treeBytes);
@@ -178,7 +179,52 @@ static void RadixSort(std::vector<MortonPrimitive> *v) {
     // Copy final result from _tempVector_, if needed
     if (nPasses & 1) std::swap(*v, tempVector);
 }
-
+#ifdef PBRT_8_TREES
+void BoxRearrange(Bounds3f *b,  const int dirIsNeg[3]){
+    if(dirIsNeg[0]){
+        float max = b->pMax.x;
+        b->pMax.x = b->pMin.x;
+        b->pMin.x = max;
+    }
+    if(dirIsNeg[1]){
+        float max = b->pMax.y;
+        b->pMax.y = b->pMin.y;
+        b->pMin.y = max;
+    }
+    if(dirIsNeg[2]){
+        float max = b->pMax.z;
+        b->pMax.z = b->pMin.z;
+        b->pMin.z = max;
+    }
+}
+int flattenCopyBVHTree(LinearBVHNode *m_nodes, BVHBuildNode *node, int *offset, const int dirIsNeg[3]) {
+    LinearBVHNode *linearNode = &m_nodes[*offset];
+    linearNode->bounds = node->bounds;
+    BoxRearrange(&linearNode->bounds, dirIsNeg);
+    int myOffset = (*offset)++;
+    if (node->nPrimitives > 0) {
+        CHECK(!node->children[0] && !node->children[1]);
+        CHECK_LT(node->nPrimitives, 65536);
+        linearNode->primitivesOffset = node->firstPrimOffset;
+        linearNode->nPrimitives = node->nPrimitives;
+    } else {
+        // Create interior flattened BVH node
+        linearNode->axis = node->splitAxis;
+        linearNode->nPrimitives = 0;
+        if(dirIsNeg[linearNode->axis]){
+            flattenCopyBVHTree(m_nodes, node->children[1], offset, dirIsNeg);
+            linearNode->secondChildOffset =
+                flattenCopyBVHTree(m_nodes, node->children[0], offset, dirIsNeg); 
+        }
+        else{
+            flattenCopyBVHTree(m_nodes, node->children[0], offset, dirIsNeg);
+            linearNode->secondChildOffset =
+                flattenCopyBVHTree(m_nodes, node->children[1], offset, dirIsNeg);
+        }
+    }
+    return myOffset;
+}
+#endif // PBRT_8_TREES
 // BVHAccel Method Definitions
 BVHAccel::BVHAccel(std::vector<std::shared_ptr<Primitive>> p,
                    int maxPrimsInNode, SplitMethod splitMethod)
@@ -204,13 +250,18 @@ BVHAccel::BVHAccel(std::vector<std::shared_ptr<Primitive>> p,
         root = HLBVHBuild(arena, primitiveInfo, &totalNodes, orderedPrims);
     else
         root = recursiveBuild(arena, primitiveInfo, 0, primitives.size(),
-                              &totalNodes, orderedPrims);
+                          &totalNodes, orderedPrims);
+
     primitives.swap(orderedPrims);
     primitiveInfo.resize(0);
     LOG(INFO) << StringPrintf("BVH created with %d nodes for %d "
                               "primitives (%.2f MB), arena allocated %.2f MB",
                               totalNodes, (int)primitives.size(),
+                              #ifndef PBRT_8_TREES
                               float(totalNodes * sizeof(LinearBVHNode)) /
+                              #else
+                              float(totalNodes * sizeof(LinearBVHNode) * 8) /
+                              #endif
                               (1024.f * 1024.f),
                               float(arena.TotalAllocated()) /
                               (1024.f * 1024.f));
@@ -218,14 +269,34 @@ BVHAccel::BVHAccel(std::vector<std::shared_ptr<Primitive>> p,
     // Compute representation of depth-first traversal of BVH tree
     treeBytes += totalNodes * sizeof(LinearBVHNode) + sizeof(*this) +
                  primitives.size() * sizeof(primitives[0]);
+    #ifdef PBRT_8_TREES
+    subtrees = new LinearBVHNode*[8];
+    for(int x_neg = 0; x_neg < 2; x_neg++){
+        for(int y_neg = 0; y_neg < 2; y_neg++){
+            for(int z_neg = 0; z_neg < 2; z_neg++){
+                const int dirIsNeg[3] = {x_neg, y_neg, z_neg};
+                const int index = z_neg + y_neg * 2 + x_neg * 4;
+                subtrees[index] = AllocAligned<LinearBVHNode>(totalNodes);
+                int offset = 0;
+                flattenCopyBVHTree(subtrees[index], root, &offset, dirIsNeg);
+                CHECK_EQ(totalNodes, offset);
+            }
+        }
+    }
+    #else
     nodes = AllocAligned<LinearBVHNode>(totalNodes);
     int offset = 0;
     flattenBVHTree(root, &offset);
     CHECK_EQ(totalNodes, offset);
+    #endif
 }
 
 Bounds3f BVHAccel::WorldBound() const {
+    #ifndef PBRT_8_TREES
     return nodes ? nodes[0].bounds : Bounds3f();
+    #else
+    return subtrees ? (subtrees[0] ? subtrees[0][0].bounds : Bounds3f()): Bounds3f();
+    #endif
 }
 
 struct BucketInfo {
@@ -332,7 +403,7 @@ BVHBuildNode *BVHAccel::recursiveBuild(
                         buckets[b].bounds =
                             Union(buckets[b].bounds, primitiveInfo[i].bounds);
                     }
-
+                    
                     // Compute costs for splitting after each bucket
                     Float cost[nBuckets - 1];
                     for (int i = 0; i < nBuckets - 1; ++i) {
@@ -656,9 +727,17 @@ int BVHAccel::flattenBVHTree(BVHBuildNode *node, int *offset) {
     }
     return myOffset;
 }
-
+#ifndef PBRT_8_TREES
 BVHAccel::~BVHAccel() { FreeAligned(nodes); }
-
+#else
+BVHAccel::~BVHAccel() { 
+    for (int i = 0; i < 8; i++){
+        FreeAligned(subtrees[i]);
+    }
+    delete [] subtrees;
+}
+#endif
+#ifndef PBRT_8_CLASSES
 bool BVHAccel::Intersect(const Ray &ray, SurfaceInteraction *isect) const {
     if (!nodes) return false;
     ProfilePhase p(Prof::AccelIntersect);
@@ -736,7 +815,294 @@ bool BVHAccel::IntersectP(const Ray &ray) const {
     }
     return false;
 }
+#else // PBRT_8_CLASSES is defined
 
+#if defined(PBRT_8_FUNCTIONS)
+    #include "accelerators/bvhintersect_auto.cpp"
+    bool BVHAccel::Intersect(const Ray &ray, SurfaceInteraction *isect) const {
+        ProfilePhase p(Prof::AccelIntersect);
+        if(ray.d.x < 0){
+            if(ray.d.y < 0){
+                if(ray.d.z < 0){
+                    return Intersect111(primitives, nodes, ray, isect);
+                }
+                else{
+                    return Intersect110(primitives, nodes, ray, isect);
+                }
+            }
+            else{
+                if(ray.d.z < 0){
+                    return Intersect101(primitives, nodes, ray, isect);
+                }
+                else{
+                    return Intersect100(primitives, nodes, ray, isect);
+                }
+            }
+        }
+        else{
+            if(ray.d.y < 0){
+                if(ray.d.z < 0){
+                    return Intersect011(primitives, nodes, ray, isect);
+                }
+                else{
+                    return Intersect010(primitives, nodes, ray, isect);
+                }
+            }
+            else{
+                if(ray.d.z < 0){
+                    return Intersect001(primitives, nodes, ray, isect);
+                }
+                else{
+                    return Intersect000(primitives, nodes, ray, isect);
+                }
+            }
+        }
+    }
+
+    bool BVHAccel::IntersectP(const Ray &ray) const {
+        ProfilePhase p(Prof::AccelIntersectP);
+        if(ray.d.x < 0){
+            if(ray.d.y < 0){
+                if(ray.d.z < 0){
+                    return IntersectP111(primitives, nodes, ray);
+                }
+                else{
+                    return IntersectP110(primitives, nodes, ray);
+                }
+            }
+            else{
+                if(ray.d.z < 0){
+                    return IntersectP101(primitives, nodes, ray);
+                }
+                else{
+                    return IntersectP100(primitives, nodes, ray);
+                }
+            }
+        }
+        else{
+            if(ray.d.y < 0){
+                if(ray.d.z < 0){
+                    return IntersectP011(primitives, nodes, ray);
+                }
+                else{
+                    return IntersectP010(primitives, nodes, ray);
+                }
+            }
+            else{
+                if(ray.d.z < 0){
+                    return IntersectP001(primitives, nodes, ray);
+                }
+                else{
+                    return IntersectP000(primitives, nodes, ray);
+                }
+            }
+        }
+    }
+
+#elif defined(PBRT_8_TREES) 
+    inline bool IntersectP_Arranged(const Bounds3f& bounds, const Ray &ray, const Vector3f &invDir
+                                       #ifdef CACHE_INVDIR_BY_GAMMA
+                                       , const Vector3f &invDirByGamma
+                                       #endif
+                                       )  {
+        #ifndef CACHE_INVDIR_BY_GAMMA
+        const Vector3f& invDirByGamma = invDir; // In this case, it's invDirNotByGamma
+        // This line will be removed by the optimizer
+        #endif
+        
+        // Check for ray intersection against $x$ and $y$ slabs
+        Float tMin = (bounds.pMin.x - ray.o.x) * invDir.x;
+        Float tMax = (bounds.pMax.x - ray.o.x) * invDirByGamma.x;
+        Float tyMin = (bounds.pMin.y - ray.o.y) * invDir.y;
+        Float tyMax = (bounds.pMax.y - ray.o.y) * invDirByGamma.y;
+
+        #ifndef CACHE_INVDIR_BY_GAMMA
+        // Update _tMax_ and _tyMax_ to ensure robust bounds intersection
+        tMax *= 1 + 2 * gamma(3);
+        tyMax *= 1 + 2 * gamma(3);
+        #endif
+        if (tMin > tyMax || tyMin > tMax) return false;
+        if (tyMin > tMin) tMin = tyMin;
+        if (tyMax < tMax) tMax = tyMax;
+
+        // Check for ray intersection against $z$ slab
+        Float tzMin = (bounds.pMin.z - ray.o.z) * invDir.z;
+        Float tzMax = (bounds.pMax.z - ray.o.z) * invDirByGamma.z;
+        
+        #ifndef CACHE_INVDIR_BY_GAMMA
+        // Update _tzMax_ to ensure robust bounds intersection
+        tzMax *= 1 + 2 * gamma(3);
+        #endif
+        if (tMin > tzMax || tzMin > tMax) return false;
+        if (tzMin > tMin) tMin = tzMin;
+        if (tzMax < tMax) tMax = tzMax;
+        return (tMin < ray.tMax) && (tMax > 0);
+    }
+    inline bool IntersectP_Arranged(const std::vector<std::shared_ptr<Primitive>> &primitives, 
+    const LinearBVHNode *nodes, const Ray &ray){
+        if (!nodes) return false;
+
+        Vector3f invDir(1.f / ray.d.x, 1.f / ray.d.y, 1.f / ray.d.z);
+        #ifdef CACHE_INVDIR_BY_GAMMA
+        Vector3f invDirByGamma = invDir * (1 + 2 * gamma(3));
+        #endif
+        //int dirIsNeg[3] = {invDir.x < 0, invDir.y < 0, invDir.z < 0};
+        int nodesToVisit[64];
+        int toVisitOffset = 0, currentNodeIndex = 0;
+        while (true) {
+            const LinearBVHNode *node = &nodes[currentNodeIndex];
+            if (
+                #ifndef CACHE_INVDIR_BY_GAMMA
+                IntersectP_Arranged(node->bounds, ray, invDir)
+                #else
+                IntersectP_Arranged(node->bounds, ray, invDir, invDirByGamma)
+                #endif
+                ) {
+                // Process BVH node _node_ for traversal
+                if (node->nPrimitives > 0) {
+                    for (int i = 0; i < node->nPrimitives; ++i) {
+                        if (primitives[node->primitivesOffset + i]->IntersectP(
+                                ray)) {
+                            return true;
+                        }
+                    }
+                    if (toVisitOffset == 0) break;
+                    currentNodeIndex = nodesToVisit[--toVisitOffset];
+                } else {
+                    nodesToVisit[toVisitOffset++] = node->secondChildOffset;
+                    currentNodeIndex = currentNodeIndex + 1;
+                }
+            } else {
+                if (toVisitOffset == 0) break;
+                currentNodeIndex = nodesToVisit[--toVisitOffset];
+            }
+        }
+        return false;
+    }
+    inline bool Intersect_Arranged(const std::vector<std::shared_ptr<Primitive>> &primitives, 
+    const LinearBVHNode *nodes, const Ray &ray, SurfaceInteraction *isect){
+        if (!nodes) return false;
+        bool hit = false;
+        Vector3f invDir(1.f / ray.d.x, 1.f / ray.d.y, 1.f / ray.d.z);
+        #ifdef CACHE_INVDIR_BY_GAMMA
+        Vector3f invDirByGamma = invDir * (1 + 2 * gamma(3));
+        #endif
+        //int dirIsNeg[3] = {invDir.x < 0, invDir.y < 0, invDir.z < 0};
+        int nodesToVisit[64];
+        int toVisitOffset = 0, currentNodeIndex = 0;
+        while (true) {
+            const LinearBVHNode *node = &nodes[currentNodeIndex];
+            if (
+                #ifndef CACHE_INVDIR_BY_GAMMA
+                IntersectP_Arranged(node->bounds, ray, invDir)
+                #else
+                IntersectP_Arranged(node->bounds, ray, invDir, invDirByGamma)
+                #endif
+                ) {
+                // Process BVH node _node_ for traversal
+                if (node->nPrimitives > 0) {
+                    // Intersect ray with primitives in leaf BVH node
+                    for (int i = 0; i < node->nPrimitives; ++i)
+                        if (primitives[node->primitivesOffset + i]->Intersect(
+                                ray, isect))
+                            hit = true;
+                    if (toVisitOffset == 0) break;
+                    currentNodeIndex = nodesToVisit[--toVisitOffset];
+                } else {
+                    nodesToVisit[toVisitOffset++] = node->secondChildOffset;
+                    currentNodeIndex = currentNodeIndex + 1;
+                }
+            } else {
+                if (toVisitOffset == 0) break;
+                currentNodeIndex = nodesToVisit[--toVisitOffset];
+            }
+        }
+        return hit;
+    }
+    bool BVHAccel::Intersect(const Ray &ray, SurfaceInteraction *isect) const {
+        ProfilePhase p(Prof::AccelIntersect);
+        if(ray.d.x < 0){
+            if(ray.d.y < 0){
+                if(ray.d.z < 0){
+                    return Intersect_Arranged(primitives, subtrees[7], ray, isect);
+                }
+                else{
+                    return Intersect_Arranged(primitives, subtrees[6], ray, isect);
+                }
+            }
+            else{
+                if(ray.d.z < 0){
+                    return Intersect_Arranged(primitives, subtrees[5], ray, isect);
+                }
+                else{
+                    return Intersect_Arranged(primitives, subtrees[4], ray, isect);
+                }
+            }
+        }
+        else{
+            if(ray.d.y < 0){
+                if(ray.d.z < 0){
+                    return Intersect_Arranged(primitives, subtrees[3], ray, isect);
+                }
+                else{
+                    return Intersect_Arranged(primitives, subtrees[2], ray, isect);
+                }
+            }
+            else{
+                if(ray.d.z < 0){
+                    return Intersect_Arranged(primitives, subtrees[1], ray, isect);
+                }
+                else{
+                    return Intersect_Arranged(primitives, subtrees[0], ray, isect);
+                }
+            }
+        }
+    }
+
+    bool BVHAccel::IntersectP(const Ray &ray) const {
+        ProfilePhase p(Prof::AccelIntersectP);
+        if(ray.d.x < 0){
+            if(ray.d.y < 0){
+                if(ray.d.z < 0){
+                    return IntersectP_Arranged(primitives, subtrees[7], ray);
+                }
+                else{
+                    return IntersectP_Arranged(primitives, subtrees[6], ray);
+                }
+            }
+            else{
+                if(ray.d.z < 0){
+                    return IntersectP_Arranged(primitives, subtrees[5], ray);
+                }
+                else{
+                    return IntersectP_Arranged(primitives, subtrees[4], ray);
+                }
+            }
+        }
+        else{
+            if(ray.d.y < 0){
+                if(ray.d.z < 0){
+                    return IntersectP_Arranged(primitives, subtrees[3], ray);
+                }
+                else{
+                    return IntersectP_Arranged(primitives, subtrees[2], ray);
+                }
+            }
+            else{
+                if(ray.d.z < 0){
+                    return IntersectP_Arranged(primitives, subtrees[1], ray);
+                }
+                else{
+                    return IntersectP_Arranged(primitives, subtrees[0], ray);
+                }
+            }
+        }
+    }
+
+#endif //PBRT_8_FUNCTIONS or PBRT_8_TREES
+
+
+#endif //PBRT_8_CLASSES
 std::shared_ptr<BVHAccel> CreateBVHAccelerator(
     std::vector<std::shared_ptr<Primitive>> prims, const ParamSet &ps) {
     std::string splitMethodName = ps.FindOneString("splitmethod", "sah");
