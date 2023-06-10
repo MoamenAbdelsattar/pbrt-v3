@@ -288,6 +288,27 @@ ELSE ()
 ENDIF ()
 
 ###########################################################################
+# 8-classes-bvh
+
+
+IF ( PBRT_8_FUNCTIONS )
+    ADD_DEFINITIONS ( -D PBRT_8_CLASSES )
+    ADD_DEFINITIONS ( -D PBRT_8_FUNCTIONS )
+ELSEIF ( PBRT_8_TREES )
+    ADD_DEFINITIONS ( -D PBRT_8_CLASSES )
+    ADD_DEFINITIONS ( -D PBRT_8_TREES )
+ENDIF ()
+
+IF ( PBRT_8_CLASSES_DEBUG )
+    ADD_DEFINITIONS ( -D PBRT_8_CLASSES_DEBUG )
+ELSEIF( PBRT_8_CLASSES_BENCHMARK )
+    ADD_DEFINITIONS ( -D PBRT_8_CLASSES_BENCHMARK )
+ENDIF ()
+
+IF ( CACHE_INVDIR_BY_GAMMA )
+    ADD_DEFINITIONS ( -D CACHE_INVDIR_BY_GAMMA )
+ENDIF ()
+###########################################################################
 # zlib
 
 FIND_PACKAGE ( ZLIB )
