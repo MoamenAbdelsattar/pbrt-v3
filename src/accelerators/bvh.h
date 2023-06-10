@@ -92,6 +92,12 @@ class BVHAccel : public Aggregate {
     const SplitMethod splitMethod;
     std::vector<std::shared_ptr<Primitive>> primitives;
     LinearBVHNode *nodes = nullptr;
+    
+    // BVH-accel
+    // #ifndef PBRT_8_TREES // I decided to keep this pointer in all versions to be able to build all the 
+                            // three versions by just replacing one object file
+    LinearBVHNode ** subtrees = nullptr;
+    // #Endif
 };
 
 std::shared_ptr<BVHAccel> CreateBVHAccelerator(
