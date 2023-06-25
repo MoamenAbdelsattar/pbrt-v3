@@ -1,8 +1,10 @@
+pbrt-8-classes
+===============
+This repository includes a modification that speeds up bvh-tree traversal. I'm 
+looking forward to getting the opportunity to describe this modification in a paper.
+
 pbrt, Version 3
 ===============
-
-[![Build Status](https://travis-ci.org/mmp/pbrt-v3.svg?branch=master)](https://travis-ci.org/mmp/pbrt-v3)
-[![Build status](https://ci.appveyor.com/api/projects/status/mlm9g91ejxlcn67s/branch/master?svg=true)](https://ci.appveyor.com/project/mmp/pbrt-v3/branch/master)
 
 This repository holds the source code to the version of pbrt that is
 described in the third edition of *Physically Based Rendering: From
